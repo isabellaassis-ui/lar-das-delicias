@@ -15,8 +15,9 @@ ON_VERCEL = bool(os.getenv('VERCEL'))
 # Na Vercel só /tmp é gravável. Sem DB_PATH (ou com um caminho não gravável), o banco vai para lá.
 DB = Path(os.getenv('DB_PATH') or ('/tmp/lar.db' if ON_VERCEL else str(ROOT/'data'/'lar.db')))
 SECRET = os.getenv('APP_SECRET', '')
-COOKIE_SECURE = os.getenv('COOKIE_SECURE', 'false').lower() == 'true'
-SIMULATE_CARD = os.getenv('SIMULATE_CARD', 'false').lower() == 'true'
+# Na Vercel (sempre HTTPS) o cookie seguro e o cartão simulado já vêm ligados por padrão; as variáveis só servem para mudar isso.
+COOKIE_SECURE = os.getenv('COOKIE_SECURE', 'true' if ON_VERCEL else 'false').lower() == 'true'
+SIMULATE_CARD = os.getenv('SIMULATE_CARD', 'true' if ON_VERCEL else 'false').lower() == 'true'
 TURSO_URL = os.getenv('TURSO_DATABASE_URL', '').strip()   # banco remoto (Turso): dados permanentes
 TURSO_TOKEN = os.getenv('TURSO_AUTH_TOKEN', '').strip()
 CONFIG_ERROR = ''   # problema de configuração mostrado como página clara (em vez de erro 500)

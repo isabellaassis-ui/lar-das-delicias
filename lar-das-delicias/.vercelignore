@@ -5,3 +5,4 @@ __pycache__
 pitch-lar-das-delicias.pdf
 render.yaml
 iniciar.ps1
+.env.vercel
