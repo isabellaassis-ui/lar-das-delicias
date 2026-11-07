@@ -40,3 +40,5 @@ O site de referência consultado é https://lar-das-delicias.vercel.app/. Os ite
 **Entrega:** a configuração continua usando taxa fixa escolhida pela proprietária (zero por padrão); não há serviço de cálculo por endereço. **Agenda:** não há controle de capacidade: a aceitação é sempre decisão humana.
 
 **Cartão (simulação):** com `SIMULATE_CARD=true` no `.env`, pedidos pagos por cartão recebem, após o aceite, um link de pagamento **simulado** (`/pagar/<código>`). Ele não cobra nada nem usa gateway real; apenas marca o pagamento como aguardando conferência da proprietária. Deixe `SIMULATE_CARD=false` em produção.
+
+**Banco permanente (Vercel/Turso):** se `TURSO_DATABASE_URL` e `TURSO_AUTH_TOKEN` estiverem definidos, o sistema grava tudo (pedidos, clientes, financeiro e comprovantes, até 4 MB) no Turso em vez de arquivos locais. Na primeira execução ele carrega o cardápio inicial da pasta `seed/`. Sem essas variáveis, continua usando o SQLite local.

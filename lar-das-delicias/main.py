@@ -1,5 +1,5 @@
 """Lar das Delícias: API e interface. Não há dados fictícios nem confirmação automática de Pix."""
-import os, sqlite3, json, secrets, hashlib, hmac, base64, csv, io, re
+import os, sqlite3, json, secrets, hashlib, hmac, base64, csv, io, re, html, shutil, tempfile, urllib.request, urllib.error
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from contextlib import contextmanager
@@ -11,25 +11,136 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parent
-DB = Path(os.getenv('DB_PATH', str(ROOT/'data'/'lar.db')))
+ON_VERCEL = bool(os.getenv('VERCEL'))
+# Na Vercel só /tmp é gravável. Sem DB_PATH (ou com um caminho não gravável), o banco vai para lá.
+DB = Path(os.getenv('DB_PATH') or ('/tmp/lar.db' if ON_VERCEL else str(ROOT/'data'/'lar.db')))
 SECRET = os.getenv('APP_SECRET', '')
 COOKIE_SECURE = os.getenv('COOKIE_SECURE', 'false').lower() == 'true'
 SIMULATE_CARD = os.getenv('SIMULATE_CARD', 'false').lower() == 'true'
+TURSO_URL = os.getenv('TURSO_DATABASE_URL', '').strip()   # banco remoto (Turso): dados permanentes
+TURSO_TOKEN = os.getenv('TURSO_AUTH_TOKEN', '').strip()
+CONFIG_ERROR = ''   # problema de configuração mostrado como página clara (em vez de erro 500)
+INIT_ERROR = ''
 if len(SECRET) < 32:
-    raise RuntimeError('Configure APP_SECRET com 32 ou mais caracteres. Veja .env.example.')
-SEED_DB = ROOT/'seed'/'lar.db'
-if not DB.exists() and SEED_DB.exists():  # primeira execução: parte do cardápio já cadastrado, sem dados de clientes
-    import shutil
+    if not ON_VERCEL:
+        raise RuntimeError('Configure APP_SECRET com 32 ou mais caracteres. Veja .env.example.')
+    CONFIG_ERROR = 'Falta a variável APP_SECRET (32 ou mais caracteres). Adicione em Settings > Environment Variables da Vercel e faça um novo deploy.'
+    SECRET = secrets.token_urlsafe(48)
+
+if TURSO_URL and not TURSO_TOKEN:
+    CONFIG_ERROR = 'Falta a variável TURSO_AUTH_TOKEN (token do banco Turso).'
+
+def _dir_writable(folder):
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        return os.access(folder, os.W_OK)
+    except OSError:
+        return False
+
+if not TURSO_URL and not _dir_writable(DB.parent):
+    DB = Path(tempfile.gettempdir())/'lar.db'
     DB.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(SEED_DB, DB)
-DB.parent.mkdir(parents=True, exist_ok=True)
+SEED_DB = ROOT/'seed'/'lar.db'
+if not TURSO_URL and not DB.exists() and SEED_DB.exists():  # primeira execução: parte do cardápio já cadastrado, sem dados de clientes
+    try: shutil.copyfile(SEED_DB, DB)
+    except OSError: pass
 PROOFS = DB.parent/'comprovantes'
-PROOFS.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title='Lar das Delícias', docs_url=None, redoc_url=None)
-app.mount('/static', StaticFiles(directory=ROOT/'static'), name='static')
+if (ROOT/'static').is_dir():
+    app.mount('/static', StaticFiles(directory=ROOT/'static'), name='static')
+
+@app.middleware('http')
+async def config_guard(request: Request, call_next):
+    problem = CONFIG_ERROR or INIT_ERROR
+    if problem:
+        return HTMLResponse('<!doctype html><meta charset="utf-8"><title>Configuração necessária</title><body style="font-family:sans-serif;max-width:640px;margin:10vh auto;padding:0 20px"><h2>Lar das Delícias: configuração necessária</h2><p>'+html.escape(problem)+'</p></body>', status_code=503)
+    return await call_next(request)
+
+class _Row(dict):
+    """Linha de resultado: acessa por nome ou por posição, como sqlite3.Row."""
+    def __getitem__(self, k):
+        if isinstance(k, int): return list(self.values())[k]
+        return dict.__getitem__(self, k)
+
+class _Cur:
+    def __init__(self, rows, lastrowid=None, rowcount=0):
+        self._r = rows; self.lastrowid = lastrowid; self.rowcount = rowcount
+    def fetchall(self): return self._r
+    def fetchone(self): return self._r[0] if self._r else None
+    def __iter__(self): return iter(self._r)
+
+class RemoteDB:
+    """Cliente mínimo do Turso/libSQL por HTTP (Hrana). Imita só o que este sistema usa do sqlite3."""
+    def __init__(self, url, token):
+        self.base = (url.replace('libsql://', 'https://', 1) if url.startswith('libsql://') else url).rstrip('/')
+        self.token = token; self.baton = None; self.first = True
+    @staticmethod
+    def _enc(v):
+        if v is None: return {'type': 'null'}
+        if isinstance(v, bool): return {'type': 'integer', 'value': str(int(v))}
+        if isinstance(v, int): return {'type': 'integer', 'value': str(v)}
+        if isinstance(v, float): return {'type': 'float', 'value': v}
+        if isinstance(v, (bytes, bytearray)): return {'type': 'blob', 'base64': base64.b64encode(bytes(v)).decode()}
+        return {'type': 'text', 'value': str(v)}
+    @staticmethod
+    def _dec(v):
+        t = v.get('type')
+        if t == 'null': return None
+        if t == 'integer': return int(v['value'])
+        if t == 'float': return float(v['value'])
+        if t == 'blob': return base64.b64decode(v['base64'] + '=' * (-len(v['base64']) % 4))
+        return v.get('value')
+    def _post(self, reqs):
+        body = json.dumps({'baton': self.baton, 'requests': reqs}).encode()
+        r = urllib.request.Request(self.base + '/v2/pipeline', data=body, method='POST', headers={'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(r, timeout=25) as x: res = json.loads(x.read())
+        except urllib.error.HTTPError as e:
+            raise sqlite3.OperationalError(f'Turso respondeu {e.code}: {e.read()[:200]!r}')
+        except urllib.error.URLError as e:
+            raise sqlite3.OperationalError(f'Turso indisponível: {e.reason}')
+        self.baton = res.get('baton')
+        if res.get('base_url'): self.base = res['base_url'].rstrip('/')
+        return res['results']
+    @staticmethod
+    def _raise(err):
+        msg = err.get('message', 'erro do banco')
+        raise (sqlite3.IntegrityError if 'constraint' in msg.lower() else sqlite3.OperationalError)(msg)
+    def execute(self, sql, args=()):
+        reqs = []
+        if self.first: reqs.append({'type': 'execute', 'stmt': {'sql': 'PRAGMA foreign_keys=ON', 'want_rows': False}})
+        reqs.append({'type': 'execute', 'stmt': {'sql': sql, 'args': [self._enc(a) for a in args], 'want_rows': True}})
+        results = self._post(reqs); self.first = False
+        last = results[-1]
+        if last['type'] == 'error': self._raise(last['error'])
+        res = last['response']['result']
+        cols = [c['name'] for c in res['cols']]
+        rows = [_Row(zip(cols, [self._dec(v) for v in r])) for r in res['rows']]
+        lid = res.get('last_insert_rowid')
+        return _Cur(rows, int(lid) if lid is not None else None, res.get('affected_row_count', 0))
+    def executescript(self, script):
+        script = '\n'.join(l for l in script.splitlines() if not l.strip().upper().startswith('PRAGMA JOURNAL_MODE'))
+        results = self._post([{'type': 'sequence', 'sql': script}])
+        if results[-1]['type'] == 'error': self._raise(results[-1]['error'])
+    def close(self): pass
+
+def seed_if_empty(db):
+    """Na primeira execução, carrega o cardápio inicial (produtos, categorias, buffet e textos da loja)."""
+    if row(db, "SELECT value FROM settings WHERE key='seeded'"): return
+    if not row(db, 'SELECT id FROM products LIMIT 1') and SEED_DB.exists():
+        src = sqlite3.connect(SEED_DB); src.row_factory = sqlite3.Row
+        for table in ('categories', 'products', 'buffet_items', 'settings'):
+            for r in src.execute(f'SELECT * FROM {table}').fetchall():
+                cols = list(r.keys())
+                db.execute(f"INSERT OR REPLACE INTO {table}({','.join(cols)}) VALUES({','.join('?' for _ in cols)})", tuple(r))
+        src.close()
+    db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('seeded','1')")
 
 @contextmanager
 def conn():
+    if TURSO_URL:
+        yield RemoteDB(TURSO_URL, TURSO_TOKEN)
+        return
     db = sqlite3.connect(DB, timeout=20, isolation_level=None)
     db.row_factory=sqlite3.Row
     db.execute('PRAGMA foreign_keys=ON')
@@ -95,6 +206,7 @@ def init():
         CREATE TABLE IF NOT EXISTS calendar_events(id INTEGER PRIMARY KEY,title TEXT NOT NULL,starts_at TEXT NOT NULL,ends_at TEXT NOT NULL DEFAULT '',description TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS transitions(id INTEGER PRIMARY KEY,product_id INTEGER NOT NULL UNIQUE REFERENCES products(id),plan TEXT NOT NULL DEFAULT '',target_date TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'planejado');
         CREATE TABLE IF NOT EXISTS buffet_items(id INTEGER PRIMARY KEY,category TEXT NOT NULL,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',price_cents INTEGER NOT NULL CHECK(price_cents>=0),unit_label TEXT NOT NULL DEFAULT '',serves INTEGER NOT NULL DEFAULT 0,available INTEGER NOT NULL DEFAULT 1,sort_order INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS proofs(filename TEXT PRIMARY KEY,mime TEXT NOT NULL,content BLOB NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
         CREATE INDEX IF NOT EXISTS idx_orders_delivery ON orders(delivery_date);
         CREATE INDEX IF NOT EXISTS idx_items_order ON order_items(order_id);
@@ -108,11 +220,13 @@ def init():
             for n,(cat,name,desc,price,unit,serves) in enumerate(BUFFET_SEED):
                 db.execute('INSERT INTO buffet_items(category,name,description,price_cents,unit_label,serves,sort_order) VALUES(?,?,?,?,?,?,?)',(cat,name,desc,price*100,unit,serves,n))
         defaults={'brand_story': 'Tudo começou na cozinha, em 2016, com um desejo simples: transformar ingredientes em carinho. A Jociara começou preparando alimentos artesanais, feitos com cuidado, do jeito que se faz em casa, e cada encomenda levava um pouco do seu afeto até a mesa de quem a recebia.\n\nFoi dentro da própria família que a vida mudou o rumo da sua cozinha. Ao viver de perto os desafios da APLV, a alergia à proteína do leite de vaca, ela entendeu na prática o que é ler cada rótulo com atenção e o quanto importa que ninguém se sinta de fora na hora de celebrar.\n\nDessa vivência nasceu a vontade de estudar, testar e criar receitas inclusivas, que respeitam diferentes necessidades alimentares sem abrir mão do sabor, da beleza e do aconchego de um bolo bem feito.\n\nHoje, o Lar das Delícias segue se transformando aos poucos, receita por receita, sempre guiado pelo cuidado, pela transparência e pelo prazer de compartilhar a mesa. Por isso cada item mostra seus ingredientes e, quando existe, a versão tradicional e a inclusiva lado a lado: para que cada pessoa escolha com segurança e carinho.\n\nMais do que um cardápio, é um convite: venha para a mesa. Aqui, tem lugar para todo mundo.', 'hero_title':'Sabores para compartilhar, carinho em cada detalhe', 'hero_subtitle':'Encomendas artesanais e opções inclusivas, feitas com atenção às suas necessidades.', 'phone':'', 'instagram':'https://www.instagram.com/lar_das_delicias?mdxt=NDBydnhleWhjdm9o', 'address':'', 'opening_hours':'', 'pix_key':'', 'pix_instructions':'O pagamento é confirmado manualmente pela equipe.', 'delivery_fee':'0', 'logo_url':'/static/logo.png', 'hero_image_url':'', 'email':'', 'cross_contact_notice':'Consulte os ingredientes, os alergênicos e a possibilidade de contato cruzado de cada produto antes de encomendar.'}
-        for k,v in defaults.items(): db.execute('INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)',(k,v))
+        pairs=list(defaults.items())
+        db.execute('INSERT OR IGNORE INTO settings(key,value) VALUES '+','.join(['(?,?)']*len(pairs)),tuple(x for kv in pairs for x in kv))
         email=os.getenv('ADMIN_EMAIL','').lower().strip()
         pw=os.getenv('ADMIN_PASSWORD','')
         if email and len(pw)>=12 and not row(db,'SELECT id FROM users LIMIT 1'):
             db.execute('INSERT INTO users(email,password_hash,created_at) VALUES(?,?,?)',(email,hashpw(pw),now()))
+        seed_if_empty(db)
 
 def hashpw(pw):
     salt=secrets.token_bytes(16)
@@ -124,7 +238,11 @@ def checkpw(pw,stored):
         return hmac.compare_digest(hashlib.pbkdf2_hmac('sha256',pw.encode(),x[:16],240000),x[16:])
     except Exception:return False
 
-init()
+try:
+    init()
+except Exception as e:
+    if not ON_VERCEL: raise
+    INIT_ERROR = f'Erro ao iniciar o banco de dados: {type(e).__name__}: {e}'
 
 def token(uid):
     msg=f'{uid}:{int((datetime.now(timezone.utc)+timedelta(hours=12)).timestamp())}'
@@ -300,15 +418,16 @@ async def upload_proof(code:str,request:Request,phone:str=''):
     kinds={'image/png':'.png','image/jpeg':'.jpg','application/pdf':'.pdf'}
     if typ not in kinds:raise HTTPException(415,'Envie PNG, JPG ou PDF')
     body=await request.body()
-    if not body or len(body)>5*1024*1024:raise HTTPException(413,'Arquivo vazio ou maior que 5 MB')
+    if not body or len(body)>4*1024*1024:raise HTTPException(413,'Arquivo vazio ou maior que 4 MB')
     if not (body.startswith(b'\x89PNG\r\n\x1a\n') if typ=='image/png' else body.startswith(b'\xff\xd8\xff') if typ=='image/jpeg' else body.startswith(b'%PDF-')):
         raise HTTPException(422,'Formato do arquivo inválido')
     filename=secrets.token_hex(24)+kinds[typ]
-    (PROOFS/filename).write_bytes(body)
     with conn() as db:
+        db.execute('INSERT INTO proofs(filename,mime,content) VALUES(?,?,?)',(filename,typ,body))
         db.execute("UPDATE orders SET proof_file=?,proof_uploaded_at=?,payment_status='comprovante_enviado' WHERE id=?",(filename,now(),order['id']))
+        if order['proof_file']: db.execute('DELETE FROM proofs WHERE filename=?',(order['proof_file'],))
     if order['proof_file']:
-        try:(PROOFS/order['proof_file']).unlink(missing_ok=True)
+        try:(PROOFS/order['proof_file']).unlink(missing_ok=True)  # comprovantes antigos salvos em arquivo
         except OSError:pass
     return {'ok':True,'message':'Comprovante recebido. A confirmação será feita pela proprietária.'}
 
@@ -317,6 +436,8 @@ def admin_proof(order_id:int,request:Request):
     auth(request)
     with conn() as db: order=row(db,'SELECT proof_file FROM orders WHERE id=?',(order_id,))
     if not order or not order['proof_file']:raise HTTPException(404,'Comprovante indisponível')
+    with conn() as db: blob=row(db,'SELECT mime,content FROM proofs WHERE filename=?',(order['proof_file'],))
+    if blob:return Response(blob['content'],media_type=blob['mime'],headers={'Cache-Control':'no-store'})
     path=PROOFS/Path(order['proof_file']).name
     if not path.is_file():raise HTTPException(404,'Arquivo não encontrado')
     return FileResponse(path,media_type={'.png':'image/png','.jpg':'image/jpeg','.pdf':'application/pdf'}[path.suffix],headers={'Cache-Control':'no-store'})
