@@ -30,6 +30,12 @@ if len(SECRET) < 32:
 
 if TURSO_URL and not TURSO_TOKEN:
     CONFIG_ERROR = 'Falta a variável TURSO_AUTH_TOKEN (token do banco Turso).'
+if TURSO_URL and not TURSO_URL.startswith(('libsql://', 'https://', 'http://')):
+    CONFIG_ERROR = 'A variável TURSO_DATABASE_URL não é uma URL válida (deve começar com libsql://). Troque pelo endereço real do banco Turso, ou apague as variáveis TURSO_DATABASE_URL e TURSO_AUTH_TOKEN para usar o modo de demonstração.'
+# Valores de exemplo do arquivo .env.vercel que ninguém trocou: nunca iniciar com eles (senha de admin previsível).
+for _nome in ('ADMIN_EMAIL', 'ADMIN_PASSWORD', 'TURSO_DATABASE_URL', 'TURSO_AUTH_TOKEN'):
+    if os.getenv(_nome, '').strip().upper().startswith(('COLOQUE_', 'COLE_')):
+        CONFIG_ERROR = f'A variável {_nome} ainda está com o texto de exemplo. Troque pelo valor real em Settings > Environment Variables da Vercel e faça um novo deploy.'
 
 def _dir_writable(folder):
     try:
@@ -240,7 +246,7 @@ def checkpw(pw,stored):
     except Exception:return False
 
 try:
-    init()
+    if not CONFIG_ERROR: init()
 except Exception as e:
     if not ON_VERCEL: raise
     INIT_ERROR = f'Erro ao iniciar o banco de dados: {type(e).__name__}: {e}'
