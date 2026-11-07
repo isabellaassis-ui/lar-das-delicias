@@ -1,1 +1,0 @@
-# lar-das-delicias

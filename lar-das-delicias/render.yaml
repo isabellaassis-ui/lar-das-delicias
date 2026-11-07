@@ -1,0 +1,28 @@
+# Configuração de deploy no Render (https://render.com). Use: New > Blueprint > escolha este repositório.
+services:
+  - type: web
+    name: lar-das-delicias
+    runtime: python
+    plan: starter            # disco persistente exige plano pago
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/public
+    disk:
+      name: dados
+      mountPath: /data       # guarda o banco (lar.db) e a pasta de comprovantes
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: APP_SECRET
+        generateValue: true  # chave secreta gerada pelo Render
+      - key: ADMIN_EMAIL
+        sync: false          # você informa no painel do Render
+      - key: ADMIN_PASSWORD
+        sync: false          # mínimo de 12 caracteres
+      - key: DB_PATH
+        value: /data/lar.db
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: SIMULATE_CARD
+        value: "true"        # link de cartão é simulação; use "false" quando integrar pagamento real

@@ -1,0 +1,7 @@
+.venv
+data
+.env
+__pycache__
+pitch-lar-das-delicias.pdf
+render.yaml
+iniciar.ps1
